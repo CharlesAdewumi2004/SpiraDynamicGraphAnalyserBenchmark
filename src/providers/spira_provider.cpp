@@ -86,14 +86,19 @@ public:
     }
 
     void spmv(const double* x, double* y, uint32_t n) const override {
-        // Copy input into persistent vector (Spira's API requires std::vector).
-        // Use memcpy — no construction overhead, just a flat 8*N byte copy.
+        // Fallback raw-pointer path — copies into persistent vectors.
         std::memcpy(xv_.data(), x, sizeof(double) * n);
-
         spira::parallel::algorithms::spmv(
             const_cast<SpiraMatrix&>(*mat_), xv_, yv_);
-
         std::memcpy(y, yv_.data(), sizeof(double) * n);
+    }
+
+    void spmv_vec(std::vector<double>& x, std::vector<double>& y,
+                  uint32_t /*n*/) const override {
+        // Zero-copy path — PageRank writes directly into x, Spira writes
+        // directly into y.  No memcpy overhead.
+        spira::parallel::algorithms::spmv(
+            const_cast<SpiraMatrix&>(*mat_), x, y);
     }
 
     size_t nnz() const override {

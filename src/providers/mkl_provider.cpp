@@ -65,25 +65,29 @@ private:
 
         size_t nnz_count = edge_set_.size();
 
-        // Build COO sorted by row.
-        std::vector<std::pair<uint32_t, uint32_t>> coo(edge_set_.begin(),
-                                                        edge_set_.end());
-        std::sort(coo.begin(), coo.end());
+        // Build CSR via counting-sort scatter — O(nnz + N), matching the
+        // algorithmic complexity of Eigen's setFromTriplets.
+        // No temporary COO allocation needed.
 
-        // Build standard CSR arrays with MKL_INT indexing.
-        // MKL's 3-array CSR: row_ptr[n+1], col_idx[nnz], values[nnz].
+        // Pass 1: count entries per row.
         row_ptr_.assign(static_cast<size_t>(n_) + 1, 0);
-        col_idx_.resize(nnz_count);
-        values_.assign(nnz_count, 1.0);
-
-        for (size_t k = 0; k < nnz_count; ++k) {
-            row_ptr_[coo[k].first + 1]++;
+        for (const auto& [dst, src] : edge_set_) {
+            row_ptr_[dst + 1]++;
         }
+
+        // Prefix sum.
         for (MKL_INT i = 0; i < static_cast<MKL_INT>(n_); ++i) {
             row_ptr_[i + 1] += row_ptr_[i];
         }
-        for (size_t k = 0; k < nnz_count; ++k) {
-            col_idx_[k] = static_cast<MKL_INT>(coo[k].second);
+
+        // Pass 2: scatter column indices using write cursors.
+        col_idx_.resize(nnz_count);
+        values_.assign(nnz_count, 1.0);
+        write_pos_.resize(static_cast<size_t>(n_) + 1);
+        std::copy(row_ptr_.begin(), row_ptr_.end(), write_pos_.begin());
+
+        for (const auto& [dst, src] : edge_set_) {
+            col_idx_[write_pos_[dst]++] = static_cast<MKL_INT>(src);
         }
 
         // Create CSR handle using the 3-array variant (row_ptr has n+1 entries).
@@ -118,6 +122,7 @@ private:
     EdgeSet edge_set_;
 
     std::vector<MKL_INT> row_ptr_;
+    std::vector<MKL_INT> write_pos_;   // reusable scratch for scatter
     std::vector<MKL_INT> rows_start_;
     std::vector<MKL_INT> rows_end_;
     std::vector<MKL_INT> col_idx_;

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <numeric>
 
 #include <omp.h>
@@ -70,8 +69,10 @@ void run_pagerank(SpMVProvider& provider, PageRankState& state, int iterations) 
 
         // Step 2: SpMV — y = A * x.
         // Each provider is responsible for its own parallelisation here.
-        std::memset(y, 0, sizeof(double) * n);
-        provider.spmv(x, y, n);
+        // Use spmv_vec so providers with native vector APIs (Spira) avoid
+        // memcpy overhead.  Other providers delegate to raw-pointer spmv.
+        std::fill(state.scratch_y.begin(), state.scratch_y.end(), 0.0);
+        provider.spmv_vec(state.scratch_x, state.scratch_y, n);
 
         // Step 3: Apply damping and dangling node redistribution.
         double dangling_contrib = DAMPING * dangling_sum * inv_n;

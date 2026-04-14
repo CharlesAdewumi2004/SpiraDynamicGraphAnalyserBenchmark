@@ -11,11 +11,26 @@
 #
 # Usage:
 #   # On a fresh instance — clone the repo, then:
-#   tmux new-session -s bench './scripts/run_benchmarks.sh'
+#   ./scripts/run_benchmarks.sh
 #
+#   # The script auto-launches inside tmux (session "bench").
 #   # Detach: Ctrl-B D     Reattach: tmux attach -t bench
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+# ── Auto-launch inside tmux ─────────────────────────────────────────────────
+# If we're not already inside tmux, re-exec ourselves in a new tmux session.
+if [ -z "${TMUX:-}" ]; then
+    # Ensure tmux is installed.
+    if ! command -v tmux &>/dev/null; then
+        echo "[bench] tmux not found — installing..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+    fi
+
+    echo "[bench] Launching inside tmux session 'bench'..."
+    echo "[bench] Detach: Ctrl-B D   Reattach: tmux attach -t bench"
+    exec tmux new-session -s bench "$0" "$@"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
