@@ -29,7 +29,11 @@ if [ -z "${TMUX:-}" ]; then
 
     echo "[bench] Launching inside tmux session 'bench'..."
     echo "[bench] Detach: Ctrl-B D   Reattach: tmux attach -t bench"
-    exec tmux new-session -s bench "$0" "$@"
+
+    # Pass the full script path so tmux can re-exec it.
+    # Use bash -c with the full command to ensure proper shell initialisation.
+    SCRIPT_PATH="$(readlink -f "$0")"
+    exec tmux new-session -s bench "bash '$SCRIPT_PATH' $*; echo 'Press Enter to close'; read"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
