@@ -39,15 +39,37 @@ RESULTS_DIR="$ROOT_DIR/results/$TIMESTAMP"
 BUILD_DIR="$ROOT_DIR/build"
 BENCH_BIN="$BUILD_DIR/spira-bench"
 
-# Physical cores to pin to. r8i.4xlarge has 8 physical / 16 logical.
-# Adjust if your instance is different.
-TASKSET_CORES="0-7"
+# Physical cores — auto-detected below in detect_physical_cores().
+TASKSET_CORES=""
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 log()  { echo -e "${CYAN}[bench]${NC} $*"; }
+
+# ── Cleanup: restore system state on exit ────────────────────────────────────
+cleanup() {
+    echo -e "${CYAN}[bench]${NC} Restoring system state..."
+
+    # Re-enable HT sibling cores.
+    for online_file in /sys/devices/system/cpu/cpu*/online; do
+        echo 1 | sudo tee "$online_file" >/dev/null 2>&1 || true
+    done
+
+    # Re-enable NMI watchdog.
+    if [ -f /proc/sys/kernel/nmi_watchdog ]; then
+        echo 1 | sudo tee /proc/sys/kernel/nmi_watchdog >/dev/null 2>&1 || true
+    fi
+
+    # Re-enable ASLR.
+    if [ -f /proc/sys/kernel/randomize_va_space ]; then
+        echo 2 | sudo tee /proc/sys/kernel/randomize_va_space >/dev/null 2>&1 || true
+    fi
+
+    echo -e "${GREEN}[ ok ]${NC} System state restored"
+}
+trap cleanup EXIT
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 ok()   { echo -e "${GREEN}[ ok ]${NC} $*"; }
 fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
@@ -98,6 +120,27 @@ install_deps() {
         sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 2>/dev/null || true
     fi
 
+    # Intel MKL (from oneAPI repository).
+    if ! pkg-config --exists mkl-dynamic-lp64-seq 2>/dev/null && [ ! -d /opt/intel/oneapi/mkl ]; then
+        log "Installing Intel MKL from oneAPI repository..."
+        wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/intel-oneapi-archive-keyring.gpg 2>/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq intel-oneapi-mkl-devel
+        # Source the MKL environment so pkg-config / cmake can find it.
+        if [ -f /opt/intel/oneapi/setvars.sh ]; then
+            source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+        fi
+        ok "Intel MKL installed"
+    else
+        ok "Intel MKL already present"
+        if [ -f /opt/intel/oneapi/setvars.sh ]; then
+            source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+        fi
+    fi
+
     # Python packages for analysis.
     log "Installing Python analysis packages..."
     pip3 install --quiet --break-system-packages matplotlib numpy 2>/dev/null \
@@ -110,10 +153,74 @@ install_deps() {
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. HARDWARE ISOLATION
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Detect physical (non-HT) cores so we only pin to one thread per physical core.
+detect_physical_cores() {
+    log "Detecting physical core topology..."
+
+    # Method 1: Use lscpu -p to find unique physical cores.
+    # Format: CPU,Core,Socket,Node — we want unique (Socket,Core) pairs.
+    if command -v lscpu &>/dev/null; then
+        local physical_cores
+        physical_cores=$(lscpu -p=CPU,Core,Socket 2>/dev/null \
+            | grep -v '^#' \
+            | sort -t, -k3,3n -k2,2n -u \
+            | cut -d, -f1 \
+            | tr '\n' ',' \
+            | sed 's/,$//')
+
+        if [ -n "$physical_cores" ]; then
+            TASKSET_CORES="$physical_cores"
+            local count
+            count=$(echo "$physical_cores" | tr ',' '\n' | wc -l)
+            ok "Detected $count physical cores: $TASKSET_CORES"
+            return
+        fi
+    fi
+
+    # Method 2: Fallback — use first half of logical CPUs (common HT layout).
+    local total_logical
+    total_logical=$(nproc)
+    local half=$(( total_logical / 2 ))
+    if [ "$half" -lt 1 ]; then half=1; fi
+    TASKSET_CORES="0-$(( half - 1 ))"
+    warn "Could not detect topology — assuming first $half of $total_logical logical CPUs are physical: $TASKSET_CORES"
+}
+
 apply_hw_isolation() {
     banner "Applying Hardware Isolation"
 
-    # CPU performance governor.
+    # ── Detect physical cores (avoid hyperthreading) ────────────────────────
+    detect_physical_cores
+
+    # ── Disable hyperthreading siblings ─────────────────────────────────────
+    # If we can identify HT siblings, take them offline so the OS scheduler
+    # can't place anything on them (even outside our taskset).
+    log "Disabling hyperthreading siblings..."
+    local ht_disabled=0
+    if command -v lscpu &>/dev/null; then
+        # Get all logical CPUs, then subtract the physical set to find HT siblings.
+        local all_cpus physical_set
+        all_cpus=$(lscpu -p=CPU 2>/dev/null | grep -v '^#' | sort -n)
+        physical_set=$(echo "$TASKSET_CORES" | tr ',' '\n' | sort -n)
+
+        while IFS= read -r cpu_id; do
+            if ! echo "$physical_set" | grep -qx "$cpu_id"; then
+                # This is an HT sibling — take it offline.
+                if [ -f "/sys/devices/system/cpu/cpu${cpu_id}/online" ]; then
+                    echo 0 | sudo tee "/sys/devices/system/cpu/cpu${cpu_id}/online" >/dev/null 2>&1 && \
+                        ht_disabled=$((ht_disabled + 1))
+                fi
+            fi
+        done <<< "$all_cpus"
+    fi
+    if [ "$ht_disabled" -gt 0 ]; then
+        ok "Hyperthreading → disabled $ht_disabled sibling cores"
+    else
+        warn "Could not disable HT siblings (may not be present or no permission)"
+    fi
+
+    # ── CPU performance governor ────────────────────────────────────────────
     if command -v cpufreq-set &>/dev/null; then
         for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
             local id
@@ -130,27 +237,84 @@ apply_hw_isolation() {
         warn "Could not set CPU governor"
     fi
 
-    # Disable turbo boost.
+    # ── Disable turbo boost ─────────────────────────────────────────────────
     if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
         echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo >/dev/null 2>&1 || true
         ok "Turbo boost → disabled (intel_pstate)"
     elif [ -f /sys/devices/system/cpu/cpufreq/boost ]; then
         echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost >/dev/null 2>&1 || true
         ok "Turbo boost → disabled (cpufreq)"
+    elif [ -f /sys/devices/system/cpu/amd_pstate/boost ]; then
+        echo 0 | sudo tee /sys/devices/system/cpu/amd_pstate/boost >/dev/null 2>&1 || true
+        ok "Turbo boost → disabled (amd_pstate)"
     else
         warn "Turbo boost control not found"
     fi
 
-    # Disable ASLR.
+    # ── Disable ASLR ────────────────────────────────────────────────────────
     if [ -f /proc/sys/kernel/randomize_va_space ]; then
         echo 0 | sudo tee /proc/sys/kernel/randomize_va_space >/dev/null 2>&1 || true
         ok "ASLR → disabled"
     fi
 
-    # Drop filesystem caches.
+    # ── Transparent Hugepages: set to "always" ──────────────────────────────
+    # THP benefits large contiguous allocations (CSR arrays, rank vectors).
+    # "always" is better than "madvise" here since we don't call madvise().
+    if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
+        ok "Transparent Hugepages → always"
+    fi
+    if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
+        echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1 || true
+        ok "THP defrag → defer+madvise (avoid stalls)"
+    fi
+
+    # ── Move IRQs off benchmark cores ───────────────────────────────────────
+    # Set the default IRQ affinity to CPU 0 only, keeping benchmark cores clean.
+    if [ -f /proc/irq/default_smp_affinity ]; then
+        echo 1 | sudo tee /proc/irq/default_smp_affinity >/dev/null 2>&1 || true
+        ok "Default IRQ affinity → CPU 0 only"
+    fi
+    # Move existing IRQs to CPU 0 where possible.
+    local irqs_moved=0
+    for affinity_file in /proc/irq/*/smp_affinity_list; do
+        echo 0 | sudo tee "$affinity_file" >/dev/null 2>&1 && irqs_moved=$((irqs_moved + 1))
+    done 2>/dev/null
+    if [ "$irqs_moved" -gt 0 ]; then
+        ok "Moved $irqs_moved IRQs → CPU 0"
+    fi
+
+    # ── Disable kernel NMI watchdog ─────────────────────────────────────────
+    # The NMI watchdog fires periodic interrupts that add jitter.
+    if [ -f /proc/sys/kernel/nmi_watchdog ]; then
+        echo 0 | sudo tee /proc/sys/kernel/nmi_watchdog >/dev/null 2>&1 || true
+        ok "NMI watchdog → disabled"
+    fi
+
+    # ── Set scheduler to FIFO for less preemption ───────────────────────────
+    # We'll use chrt when launching the benchmark (in run_single).
+
+    # ── Drop filesystem caches ──────────────────────────────────────────────
     sync
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
     ok "Filesystem caches → dropped"
+
+    # ── Set thread count environment variables ──────────────────────────────
+    local n_physical
+    n_physical=$(echo "$TASKSET_CORES" | tr ',' '\n' | wc -l)
+    export OMP_NUM_THREADS="$n_physical"
+    export MKL_NUM_THREADS="$n_physical"
+    export OPENBLAS_NUM_THREADS="$n_physical"
+    export OMP_PROC_BIND=close
+    export OMP_PLACES=cores
+    ok "Thread counts → OMP=$n_physical  MKL=$n_physical  OpenBLAS=$n_physical"
+    ok "OMP binding  → OMP_PROC_BIND=close  OMP_PLACES=cores"
+
+    echo ""
+    log "Hardware isolation summary:"
+    log "  Physical cores:     $TASKSET_CORES"
+    log "  HT siblings offline: $ht_disabled"
+    log "  Threads per lib:    $n_physical"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -183,13 +347,17 @@ build_benchmark() {
         warn "Armadillo not found, skipping"
     fi
 
-    # MKL (optional — not in apt, needs Intel repo)
+    # MKL (installed from Intel oneAPI repo in install_deps).
+    # Source setvars.sh so cmake can find MKLConfig.cmake.
+    if [ -f /opt/intel/oneapi/setvars.sh ]; then
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+    fi
     if pkg-config --exists mkl-dynamic-lp64-seq 2>/dev/null || [ -d /opt/intel/oneapi/mkl ]; then
         cmake_flags+=( -DENABLE_MKL=ON )
         ok "Intel MKL → detected, enabling"
     else
         cmake_flags+=( -DENABLE_MKL=OFF )
-        warn "Intel MKL not found, skipping (install via Intel oneAPI for MKL support)"
+        warn "Intel MKL not found, skipping"
     fi
 
     log "CMake flags: ${cmake_flags[*]}"
@@ -236,6 +404,10 @@ save_system_info() {
         echo ""
         echo "Taskset cores: $TASKSET_CORES"
         echo "OMP_NUM_THREADS: ${OMP_NUM_THREADS:-$(nproc)}"
+        echo "MKL_NUM_THREADS: ${MKL_NUM_THREADS:-$(nproc)}"
+        echo "OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-$(nproc)}"
+        echo "OMP_PROC_BIND: ${OMP_PROC_BIND:-not set}"
+        echo "OMP_PLACES:    ${OMP_PLACES:-not set}"
         echo "Compiler:      $(g++ --version | head -1)"
         echo "CMake:         $(cmake --version | head -1)"
         echo ""
@@ -268,8 +440,14 @@ run_single() {
     local start_time
     start_time=$(date +%s)
 
-    # Pin to physical cores, redirect stderr to log file.
-    taskset -c "$TASKSET_CORES" \
+    # Drop caches before each run to equalise cold-start conditions.
+    sync
+    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+
+    # Pin to physical cores, max scheduling priority, best-effort I/O class.
+    sudo nice -n -20 \
+        ionice -c 2 -n 0 \
+        taskset -c "$TASKSET_CORES" \
         "$BENCH_BIN" \
         --benchmark_filter="$filter" \
         --benchmark_format=json \

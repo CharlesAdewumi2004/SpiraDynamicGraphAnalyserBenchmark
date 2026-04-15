@@ -68,7 +68,9 @@ if(ENABLE_EIGEN)
 endif()
 
 if(ENABLE_MKL)
-    find_package(MKL REQUIRED)
+    # oneAPI MKL provides MKLConfig.cmake — requires `source /opt/intel/oneapi/setvars.sh`
+    # before running cmake so that CMAKE_PREFIX_PATH includes the MKL directory.
+    find_package(MKL CONFIG REQUIRED)
     list(APPEND CORE_SOURCES src/providers/mkl_provider.cpp)
 endif()
 
@@ -95,8 +97,7 @@ endif()
 
 if(ENABLE_MKL)
     target_compile_definitions(spira_core PUBLIC SPIRA_HAS_MKL)
-    target_include_directories(spira_core PUBLIC ${MKL_INCLUDE_DIRS})
-    target_link_libraries(spira_core PUBLIC ${MKL_LIBRARIES})
+    target_link_libraries(spira_core PUBLIC MKL::MKL)
 endif()
 
 if(ENABLE_ARMADILLO)

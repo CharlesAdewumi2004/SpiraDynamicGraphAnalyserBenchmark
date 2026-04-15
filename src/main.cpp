@@ -214,7 +214,7 @@ BENCHMARK_DEFINE_F(PhaseCycleFixture, Run)(benchmark::State& state) {
 
 static void register_benchmarks() {
     std::vector<int> scales = {20};  // Start with SCALE-20; add 22, 24 as needed.
-    std::vector<int> batch_sizes = {1000, 10000, 100000};
+    std::vector<int> batch_sizes = {1000};
     // CSR-Reference (ID 0) is kept for the correctness reference run but
     // not registered as a benchmarked provider.
     std::vector<int> providers;
