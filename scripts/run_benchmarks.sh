@@ -81,6 +81,17 @@ banner() {
     echo ""
 }
 
+# Source Intel oneAPI/MKL environment if available.
+# setvars.sh is not compatible with strict bash modes (set -euo pipefail),
+# so we temporarily relax them.
+source_mkl_env() {
+    if [ -f /opt/intel/oneapi/setvars.sh ]; then
+        set +euo pipefail
+        source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+        set -euo pipefail
+    fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. INSTALL DEPENDENCIES
 # ═════════════════════════════════════════════════════════════════════════════
@@ -131,14 +142,12 @@ install_deps() {
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq intel-oneapi-mkl-devel
         # Source the MKL environment so pkg-config / cmake can find it.
         if [ -f /opt/intel/oneapi/setvars.sh ]; then
-            source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+            source_mkl_env
         fi
         ok "Intel MKL installed"
     else
         ok "Intel MKL already present"
-        if [ -f /opt/intel/oneapi/setvars.sh ]; then
-            source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
-        fi
+        source_mkl_env
     fi
 
     # Python packages for analysis.
@@ -349,9 +358,7 @@ build_benchmark() {
 
     # MKL (installed from Intel oneAPI repo in install_deps).
     # Source setvars.sh so cmake can find MKLConfig.cmake.
-    if [ -f /opt/intel/oneapi/setvars.sh ]; then
-        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
-    fi
+    source_mkl_env
     if pkg-config --exists mkl-dynamic-lp64-seq 2>/dev/null || [ -d /opt/intel/oneapi/mkl ]; then
         cmake_flags+=( -DENABLE_MKL=ON )
         ok "Intel MKL → detected, enabling"
