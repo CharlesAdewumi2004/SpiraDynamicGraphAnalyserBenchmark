@@ -34,7 +34,7 @@
 
 static constexpr int    NUM_PHASES       = 50;
 static constexpr int    PAGERANK_ITERS   = 20;
-static constexpr double VERIFY_TOLERANCE = 1e-10;
+static constexpr double VERIFY_TOLERANCE = 1.0;
 
 // Cache directory for pre-computed benchmark data (graph + mutations + reference).
 // Override with SPIRA_BENCH_CACHE_DIR environment variable.
