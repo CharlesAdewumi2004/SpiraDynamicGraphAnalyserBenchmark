@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
+
+using SrcAdjacency = std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>;
 
 // Pick a deletion edge: 50% uniform random, 50% hub-biased.
 static std::pair<uint32_t, uint32_t> pick_deletion(
@@ -9,7 +12,8 @@ static std::pair<uint32_t, uint32_t> pick_deletion(
     const std::vector<uint32_t>& out_degree,
     uint32_t num_nodes,
     bool hub_biased,
-    std::mt19937_64& rng)
+    std::mt19937_64& rng,
+    SrcAdjacency* src_adj_cache)
 {
     if (!hub_biased) {
         // Uniform random deletion: pick a random edge from the set.
@@ -20,14 +24,13 @@ static std::pair<uint32_t, uint32_t> pick_deletion(
     }
 
     // Hub-biased: pick source node proportional to out_degree, then pick one of
-    // its edges uniformly.
-    // Build a CDF over out_degrees.
+    // its edges uniformly. Use pre-built src_adj_cache (O(1) amortised).
     uint64_t total_degree = 0;
     for (uint32_t i = 0; i < num_nodes; ++i) {
         total_degree += out_degree[i];
     }
 
-    if (total_degree == 0) {
+    if (total_degree == 0 || src_adj_cache->empty()) {
         // Fallback to uniform.
         std::uniform_int_distribution<size_t> dist(0, current_edges.size() - 1);
         auto it = current_edges.begin();
@@ -48,23 +51,17 @@ static std::pair<uint32_t, uint32_t> pick_deletion(
         }
     }
 
-    // Collect edges from chosen_src and pick one.
-    std::vector<std::pair<uint32_t, uint32_t>> src_edges;
-    for (const auto& e : current_edges) {
-        // Edge (row, col) = (dst, src): col is source.
-        if (e.second == chosen_src) {
-            src_edges.push_back(e);
-        }
-    }
-
-    if (src_edges.empty()) {
-        // Fallback to uniform.
+    // Look up edges from chosen_src in the cache (O(1) amortised).
+    auto it = src_adj_cache->find(chosen_src);
+    if (it == src_adj_cache->end() || it->second.empty()) {
+        // Fallback to uniform if no edges found for this source.
         std::uniform_int_distribution<size_t> dist(0, current_edges.size() - 1);
-        auto it = current_edges.begin();
-        std::advance(it, dist(rng));
-        return *it;
+        auto edge_it = current_edges.begin();
+        std::advance(edge_it, dist(rng));
+        return *edge_it;
     }
 
+    const auto& src_edges = it->second;
     std::uniform_int_distribution<size_t> edist(0, src_edges.size() - 1);
     return src_edges[edist(rng)];
 }
@@ -83,6 +80,13 @@ std::vector<MutationBatch> generate_all_batches(
     std::vector<uint32_t> out_degree = out_degree_in;
     int deletions_per_batch = static_cast<int>(0.3 * insertions_per_batch);
     size_t pool_idx = 0;
+
+    // Build source adjacency cache once: O(nnz), reused for all hub-biased deletions.
+    // Without this, hub-biased deletion scans all nnz edges per deletion: O(nnz * deletions).
+    SrcAdjacency src_adj_cache;
+    for (const auto& [dst, src] : current_edges) {
+        src_adj_cache[src].push_back({dst, src});
+    }
 
     std::vector<MutationBatch> batches;
     batches.reserve(num_phases);
@@ -110,6 +114,7 @@ std::vector<MutationBatch> generate_all_batches(
 
             current_edges.insert(edge);
             out_degree[edge.second]++;
+            src_adj_cache[edge.second].push_back(edge);
             batch.mutations.push_back({edge.first, edge.second, true});
             ++inserted;
         }
@@ -118,10 +123,18 @@ std::vector<MutationBatch> generate_all_batches(
         for (int d = 0; d < deletions_per_batch && !current_edges.empty(); ++d) {
             bool hub_biased = (d % 2 == 1); // 50/50 split
             auto edge = pick_deletion(current_edges, out_degree, num_nodes,
-                                      hub_biased, rng);
+                                      hub_biased, rng, &src_adj_cache);
 
             current_edges.erase(edge);
             out_degree[edge.second]--;
+
+            // Update src_adj_cache: remove this edge from the source's list.
+            auto& src_edges = src_adj_cache[edge.second];
+            auto it = std::find(src_edges.begin(), src_edges.end(), edge);
+            if (it != src_edges.end()) {
+                src_edges.erase(it);
+            }
+
             batch.mutations.push_back({edge.first, edge.second, false});
         }
 
