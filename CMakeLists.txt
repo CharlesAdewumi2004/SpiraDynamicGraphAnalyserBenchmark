@@ -32,7 +32,7 @@ FetchContent_Declare(
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(benchmark)
 
-# ── Spira (stage4/MutilThreaded — parallel_matrix with thread pool + SIMD) ──
+# ── Spira (main — parallel_matrix with thread pool + SIMD) ──────────────────
 if(ENABLE_SPIRA)
     # Disable Spira's own tests and benchmarks when consumed as a dependency.
     set(SPIRA_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
@@ -43,7 +43,7 @@ if(ENABLE_SPIRA)
     FetchContent_Declare(
         spira
         GIT_REPOSITORY https://github.com/CharlesAdewumi2004/Spira.git
-        GIT_TAG        stage4/MutilThreaded
+        GIT_TAG        main
     )
     FetchContent_MakeAvailable(spira)
 endif()
