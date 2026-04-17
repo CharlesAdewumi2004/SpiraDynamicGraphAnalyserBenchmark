@@ -56,6 +56,7 @@ public:
         // With compact_preserve lock policy, lock_for_compact() calls
         // sort_and_dedup_keep_zeros() so zeros survive to merge_csr(), which
         // then suppresses the old CSR entry — correct incremental deletion.
+        mat_->open();
         mat_->parallel_fill(
             [&batch](auto& rows, std::size_t row_start, std::size_t row_end,
                      std::size_t /*thread_id*/) {
