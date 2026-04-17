@@ -46,3 +46,6 @@ build/
 
 # Benchmark results (generated)
 results/
+
+# Pre-computed benchmark data cache (hundreds of MB)
+bench_cache/

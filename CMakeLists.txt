@@ -55,6 +55,7 @@ set(CORE_SOURCES
     src/mutation.cpp
     src/pagerank.cpp
     src/verify.cpp
+    src/serialise.cpp
     src/providers/csr_reference.cpp
 )
 

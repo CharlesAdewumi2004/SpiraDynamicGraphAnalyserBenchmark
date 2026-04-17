@@ -43,8 +43,29 @@ RESULTS_DIR="$ROOT_DIR/results/$TIMESTAMP"
 BUILD_DIR="$ROOT_DIR/build"
 BENCH_BIN="$BUILD_DIR/spira-bench"
 
+# Cache directory for pre-computed benchmark data (graph + mutations + reference).
+# Persists across runs so expensive init (hours for B=100000) only happens once.
+# Delete this directory manually if you change rmat params, seed, or batch sizes.
+export SPIRA_BENCH_CACHE_DIR="${SPIRA_BENCH_CACHE_DIR:-$ROOT_DIR/bench_cache}"
+
 # Physical cores — auto-detected below in detect_physical_cores().
 TASKSET_CORES=""
+
+# ── Parse CLI flags ─────────────────────────────────────────────────────────
+CLEAN_CACHE=0
+PREWARM_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --clean-cache)  CLEAN_CACHE=1 ;;
+        --prewarm)      PREWARM_ONLY=1 ;;
+        --help|-h)
+            echo "Usage: $0 [--clean-cache] [--prewarm]"
+            echo "  --clean-cache  Delete cached benchmark data before running"
+            echo "  --prewarm      Generate cache for all batch sizes but skip the timed runs"
+            exit 0
+            ;;
+    esac
+done
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -437,6 +458,79 @@ save_system_info() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 4b. PREWARM CACHE
+# ═════════════════════════════════════════════════════════════════════════════
+# Runs each (SCALE, batch_size) combination once with a nearly-empty filter so
+# ensure_initialised() fires, generates its data, and writes the cache file.
+# Subsequent full runs hit the cache and skip the expensive init step entirely.
+prewarm_cache() {
+    banner "Prewarming Cache"
+    log "Cache directory: $SPIRA_BENCH_CACHE_DIR"
+    mkdir -p "$SPIRA_BENCH_CACHE_DIR"
+
+    # Discover all (SCALE, batch_size) combos from registered benchmarks.
+    local combos
+    combos=$("$BENCH_BIN" --benchmark_list_tests 2>/dev/null \
+        | sed -n 's|PhaseCycle/\(S[0-9]\+/B[0-9]\+\)/.*|\1|p' \
+        | sort -u)
+
+    if [ -z "$combos" ]; then
+        warn "No benchmark combos found — skipping prewarm"
+        return
+    fi
+
+    local n_combos
+    n_combos=$(echo "$combos" | wc -l)
+    log "Will prewarm $n_combos (scale, batch_size) combos"
+
+    local idx=0
+    while IFS= read -r combo; do
+        idx=$((idx + 1))
+        local scale_str="${combo%%/*}"   # S20
+        local batch_str="${combo##*/}"    # B1000
+        local cache_file="$SPIRA_BENCH_CACHE_DIR/${scale_str}_${batch_str}.bin"
+
+        if [ -f "$cache_file" ]; then
+            ok "[$idx/$n_combos] $combo — cache hit ($(du -h "$cache_file" | cut -f1)), skipping"
+            continue
+        fi
+
+        log "[$idx/$n_combos] $combo — generating..."
+        local start_time
+        start_time=$(date +%s)
+
+        # Pick any single provider benchmark for this combo to trigger init.
+        # The actual timed work is tiny because the cache write happens first
+        # inside ensure_initialised.  Use --benchmark_min_time to run exactly
+        # one iteration-set so we don't waste time on multiple repeats.
+        local any_bench
+        any_bench=$("$BENCH_BIN" --benchmark_list_tests 2>/dev/null \
+            | grep "PhaseCycle/${combo}/" | head -1)
+        if [ -z "$any_bench" ]; then
+            warn "  no benchmark matching $combo — skipping"
+            continue
+        fi
+
+        sudo -E nice -n -20 \
+            taskset -c "$TASKSET_CORES" \
+            env SPIRA_BENCH_CACHE_DIR="$SPIRA_BENCH_CACHE_DIR" \
+                OMP_NUM_THREADS="${OMP_NUM_THREADS:-}" \
+                MKL_NUM_THREADS="${MKL_NUM_THREADS:-}" \
+                OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-}" \
+            "$BENCH_BIN" \
+            --benchmark_filter="^$(echo "$any_bench" | sed 's/[.[\*^$()+?{|]/\\&/g')$" \
+            --benchmark_format=json \
+            --benchmark_out=/dev/null \
+            2>> "$RESULTS_DIR/prewarm.log" >/dev/null
+
+        local elapsed=$(( $(date +%s) - start_time ))
+        local size="?"
+        [ -f "$cache_file" ] && size=$(du -h "$cache_file" | cut -f1)
+        ok "[$idx/$n_combos] $combo — ${elapsed}s, cached ${size}"
+    done <<< "$combos"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 5. RUN BENCHMARKS
 # ═════════════════════════════════════════════════════════════════════════════
 run_single() {
@@ -456,9 +550,16 @@ run_single() {
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
 
     # Pin to physical cores, max scheduling priority, best-effort I/O class.
-    sudo nice -n -20 \
+    # Use sudo -E so SPIRA_BENCH_CACHE_DIR (and thread counts) propagate.
+    sudo -E nice -n -20 \
         ionice -c 2 -n 0 \
         taskset -c "$TASKSET_CORES" \
+        env SPIRA_BENCH_CACHE_DIR="$SPIRA_BENCH_CACHE_DIR" \
+            OMP_NUM_THREADS="${OMP_NUM_THREADS:-}" \
+            MKL_NUM_THREADS="${MKL_NUM_THREADS:-}" \
+            OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-}" \
+            OMP_PROC_BIND="${OMP_PROC_BIND:-}" \
+            OMP_PLACES="${OMP_PLACES:-}" \
         "$BENCH_BIN" \
         --benchmark_filter="$filter" \
         --benchmark_format=json \
@@ -614,10 +715,26 @@ main() {
 
     mkdir -p "$RESULTS_DIR"
 
+    # Handle --clean-cache flag.
+    if [ "$CLEAN_CACHE" -eq 1 ]; then
+        log "Wiping cache directory: $SPIRA_BENCH_CACHE_DIR"
+        rm -rf "$SPIRA_BENCH_CACHE_DIR"
+    fi
+    log "Cache directory: $SPIRA_BENCH_CACHE_DIR"
+
     install_deps
     apply_hw_isolation
     build_benchmark
     save_system_info
+
+    # Prewarm cache so all long init happens upfront (outside timed runs).
+    prewarm_cache
+
+    if [ "$PREWARM_ONLY" -eq 1 ]; then
+        ok "Prewarm complete — skipping benchmark runs (--prewarm)"
+        exit 0
+    fi
+
     run_all
     merge_and_analyse
 
