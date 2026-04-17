@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Options ──────────────────────────────────────────────────────────────────
-option(ENABLE_SPIRA     "Build with Spira provider (stage4)"  ON)
+option(ENABLE_SPIRA     "Build with Spira provider"           ON)
 option(ENABLE_EIGEN     "Build with Eigen provider"           OFF)
 option(ENABLE_MKL       "Build with Intel MKL provider"       OFF)
 option(ENABLE_ARMADILLO "Build with Armadillo provider"       OFF)
@@ -32,7 +32,7 @@ FetchContent_Declare(
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(benchmark)
 
-# ── Spira (stage4/MutilThreaded — parallel_matrix with thread pool + SIMD) ──
+# ── Spira (main — parallel_matrix with thread pool + SIMD) ──────────────────
 if(ENABLE_SPIRA)
     # Disable Spira's own tests and benchmarks when consumed as a dependency.
     set(SPIRA_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
@@ -43,7 +43,7 @@ if(ENABLE_SPIRA)
     FetchContent_Declare(
         spira
         GIT_REPOSITORY https://github.com/CharlesAdewumi2004/Spira.git
-        GIT_TAG        stage4/MutilThreaded
+        GIT_TAG        main
     )
     FetchContent_MakeAvailable(spira)
 endif()
