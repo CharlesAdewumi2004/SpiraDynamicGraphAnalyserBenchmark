@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -13,6 +14,7 @@
 #include "pagerank.h"
 #include "provider.h"
 #include "rmat.h"
+#include "serialise.h"
 #include "verify.h"
 
 #ifdef SPIRA_HAS_EIGEN
@@ -33,6 +35,14 @@
 static constexpr int    NUM_PHASES       = 50;
 static constexpr int    PAGERANK_ITERS   = 20;
 static constexpr double VERIFY_TOLERANCE = 1e-10;
+
+// Cache directory for pre-computed benchmark data (graph + mutations + reference).
+// Override with SPIRA_BENCH_CACHE_DIR environment variable.
+static std::string bench_cache_dir() {
+    const char* env = std::getenv("SPIRA_BENCH_CACHE_DIR");
+    if (env && *env) return env;
+    return "bench_cache";
+}
 
 #ifdef SPIRA_HAS_SPIRA
 // Thread count for Spira's parallel_matrix — default to hardware concurrency.
@@ -70,6 +80,32 @@ static void ensure_initialised(BenchData& bd) {
                  bd.scale, bd.batch_size);
 
     bd.num_nodes = 1u << bd.scale;
+
+    // ── Fast path: load from binary cache if present ───────────────────────
+    const std::string cache_path = cache_file_path(
+        bench_cache_dir(), bd.scale, bd.batch_size);
+
+    {
+        CachedBenchData cached;
+        if (load_bench_data(cache_path, bd.scale, bd.batch_size, cached)) {
+            bd.num_nodes  = cached.num_nodes;
+            bd.graph      = std::move(cached.graph);
+            bd.batches    = std::move(cached.batches);
+            bd.reference  = std::move(cached.reference);
+            bd.initialised = true;
+            std::fprintf(stderr,
+                "[init]   Loaded from cache: %s\n"
+                "[init]   Initial edges: %zu   Insert pool: %zu   Phases: %zu\n",
+                cache_path.c_str(),
+                bd.graph.initial_edges.size(), bd.graph.insert_pool.size(),
+                bd.batches.size());
+            return;
+        }
+    }
+
+    std::fprintf(stderr, "[init]   No cache at %s — generating fresh.\n",
+                 cache_path.c_str());
+
     std::mt19937_64 rng(42);  // deterministic seed
 
     // 1. Generate R-MAT edges.
@@ -124,6 +160,23 @@ static void ensure_initialised(BenchData& bd) {
 
     std::fprintf(stderr, "[init]   Reference run complete. Final nnz=%zu\n",
                  bd.reference.back().expected_nnz);
+
+    // 7. Save to cache for future runs.
+    {
+        CachedBenchData to_save;
+        to_save.scale      = bd.scale;
+        to_save.batch_size = bd.batch_size;
+        to_save.num_nodes  = bd.num_nodes;
+        to_save.graph      = bd.graph;
+        to_save.batches    = bd.batches;
+        to_save.reference  = bd.reference;
+        if (save_bench_data(cache_path, to_save)) {
+            std::fprintf(stderr, "[init]   Saved cache: %s\n", cache_path.c_str());
+        } else {
+            std::fprintf(stderr, "[init]   WARN: failed to write cache file %s\n",
+                         cache_path.c_str());
+        }
+    }
 
     bd.initialised = true;
 }
@@ -214,7 +267,7 @@ BENCHMARK_DEFINE_F(PhaseCycleFixture, Run)(benchmark::State& state) {
 
 static void register_benchmarks() {
     std::vector<int> scales = {20};  // Start with SCALE-20; add 22, 24 as needed.
-    std::vector<int> batch_sizes = {1000};
+    std::vector<int> batch_sizes = {1000, 10000, 100000};
     // CSR-Reference (ID 0) is kept for the correctness reference run but
     // not registered as a benchmarked provider.
     std::vector<int> providers;
