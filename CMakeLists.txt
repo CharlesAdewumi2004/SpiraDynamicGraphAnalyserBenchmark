@@ -43,7 +43,7 @@ if(ENABLE_SPIRA)
     FetchContent_Declare(
         spira
         GIT_REPOSITORY https://github.com/CharlesAdewumi2004/Spira.git
-        GIT_TAG        stage4/MutilThreaded
+        GIT_TAG        main
     )
     FetchContent_MakeAvailable(spira)
 endif()
